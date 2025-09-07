@@ -20,7 +20,6 @@ Perfect for **Software Engineers, Backend Devs, and Freshers** preparing for int
 ✅ **Automated Feedback** (partial / full / incorrect analysis)  
 ✅ **Score Breakdown** with total marks  
 ✅ **Built with Streamlit** → lightweight & interactive UI  
-✅ **Powered by Google Gemini** → smarter than ever 😉  
 
 ---
 
