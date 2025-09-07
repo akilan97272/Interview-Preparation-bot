@@ -2,24 +2,26 @@
 import streamlit as st
 import os
 import json
-from typing import List, Dict
-import time
 import base64
-
-# OpenAI SDK
-import openai
+import google.generativeai as genai
+import re
 
 # ---- CONFIG ----
-OPENAI_API_KEY = os.getenv("gpt-5-nano-2025-08-07")
-if not OPENAI_API_KEY:
-    st.warning("Set OPENAI_API_KEY env var before running the app.")
-openai.api_key = OPENAI_API_KEY
+GEMINI_API_KEY="AIzaSyDH1H2P519Sql1bMu-gExULuhnPKao32Do" 
+if not GEMINI_API_KEY:
+    st.warning("Set GEMINI_API_KEY env var before running the app.")
+else:
+    genai.configure(api_key=GEMINI_API_KEY)
 
-MODEL = "gpt-4o"  # change to available model for your account
+# Choose a model (Flash is faster/cheaper, Pro is smarter)
+MODEL_NAME = "gemini-1.5-flash"
+model = genai.GenerativeModel(MODEL_NAME)
 
 # ---- PROMPT TEMPLATES ----
 SYSTEM_PROMPT = """
-You are an expert technical interviewer and coach. Ask role- and domain-appropriate questions. For each candidate answer, evaluate clarity, correctness (technical) or examples (behavioral), completeness, and structure. Return JSON when requested.
+You are an expert technical interviewer and coach. Ask role- and domain-appropriate questions. 
+For each candidate answer, evaluate clarity, correctness (technical) or examples (behavioral), completeness, and structure. 
+Return JSON when requested.
 """
 
 QUESTION_GEN_TEMPLATE = """Generate {n_questions} interview questions for:
@@ -28,7 +30,7 @@ domain: {domain}
 mode: {mode}
 difficulty: {difficulty}
 
-Return JSON list: [{"id":1,"question":"...","type":"coding|system-design|behavioral","expected_topics":["..."]}, ...]
+Return JSON list: [{{"id":1,"question":"...","type":"coding|system-design|behavioral","expected_topics":["..."]}}, ...]
 """
 
 EVAL_PROMPT_TEMPLATE = """You are an interviewer-evaluator.
@@ -42,32 +44,110 @@ Score and explain using this rubric:
 - accuracy_or_examples (0-3)
 - completeness (0-2)
 - structure (0-2)
+
 Return strictly JSON with fields: scores, total, feedback (list), suggested_resources (list).
 """
 
+
+def safe_json_loads(text: str):
+    """
+    Try to parse JSON robustly:
+    1) try direct json.loads
+    2) try to extract a JSON substring ([...] or {...})
+    3) try replacing single quotes with double quotes and parse
+    Returns Python object on success, else None.
+    """
+    if not isinstance(text, str):
+        return None
+    cleaned = clean_response(text)
+
+    # 1) direct parse
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    # 2) try to extract JSON-like substring
+    m = re.search(r'(\[.*\]|\{.*\})', cleaned, re.S)
+    if m:
+        candidate = m.group(1)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    # 3) try simple fix: single-quotes -> double-quotes
+    try:
+        alt = cleaned.replace("'", '"')
+        return json.loads(alt)
+    except Exception:
+        pass
+
+    return None
+
+
+
+def clean_response(text: str) -> str:
+    """Remove code fences and trim whitespace."""
+    text = re.sub(r"```(?:json|python)?", "", text)
+    text = text.replace("```", "")
+    return text.strip()
+
+def generate_questions(role, domain, mode, difficulty, n_questions):
+    p = f"Generate {n_questions} interview questions for role {role} in domain {domain} with mode {mode} and difficulty {difficulty}."
+    out = call_llm(p)                   
+    cleaned_out = clean_response(out)
+
+    try:
+        questions = json.loads(cleaned_out)  # if JSON
+        # normalize JSON into [{"question": ...}, ...]
+        if isinstance(questions, list):
+            return [{"question": q.get("question", q) if isinstance(q, dict) else str(q)} for q in questions]
+        elif isinstance(questions, dict) and "questions" in questions:
+            return [{"question": q} for q in questions["questions"]]
+        else:
+            return [{"question": str(questions)}]
+    except json.JSONDecodeError:
+        # fallback: extract lines that look like questions
+        lines = []
+        for line in cleaned_out.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            # Only keep lines that look like actual questions
+            if re.match(r'^\d+[\.\)]', s) or s.lower().startswith("q"):
+                s = re.sub(r'^\s*(?:Q\s*)?\d+\s*[\.\):-]\s*', '', s)  # strip numbering like "Q1.", "1)", "1."
+                lines.append(s)
+        # If nothing matched, just take sentences ending with '?'
+        if not lines:
+            lines = [sent.strip() for sent in re.split(r'(?<=\?)', cleaned_out) if sent.strip().endswith('?')]
+        return [{"question": q} for q in lines][:n_questions]
+
+
+
+def extract_questions(text: str):
+    # Remove markdown fences first
+    text = re.sub(r"```(?:json|python)?", "", text).strip()
+    try:
+        data = json.loads(text)
+        return data.get("questions", data)  # depends on how your prompt is structured
+    except json.JSONDecodeError:
+        return [text]  # fallback: just return raw
+
+
 # ---- HELPERS ----
 def call_llm(prompt: str, system=SYSTEM_PROMPT, max_tokens=800):
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": prompt}]
-    resp = openai.ChatCompletion.create(
-        model=MODEL,
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=0.2
-    )
-    return resp['choices'][0]['message']['content']
+    # Combine system + user text (Gemini doesn’t support "system" role)
+    full_prompt = f"{system.strip()}\n\nUser request:\n{prompt.strip()}"
 
-def generate_questions(role, domain, mode, difficulty, n_questions=4):
-    p = QUESTION_GEN_TEMPLATE.format(n_questions=n_questions, role=role, domain=domain, mode=mode, difficulty=difficulty)
-    out = call_llm(p)
-    # try parse JSON; if it fails, return fallback
-    try:
-        qlist = json.loads(out)
-        return qlist
-    except Exception:
-        # fallback: wrap lines
-        return [{"id": i+1, "question": q.strip(), "type": "general", "expected_topics": []}
-                for i,q in enumerate(out.splitlines()) if q.strip()][:n_questions]
+    resp = model.generate_content(
+        [full_prompt],
+        generation_config=genai.types.GenerationConfig(
+            max_output_tokens=max_tokens,
+            temperature=0.2,
+        )
+    )
+    return resp.text
 
 def evaluate_answer(question, answer, mode, role):
     p = EVAL_PROMPT_TEMPLATE.format(question=question, answer=answer, mode=mode, role=role)
@@ -76,7 +156,7 @@ def evaluate_answer(question, answer, mode, role):
         jobj = json.loads(out)
         return jobj
     except Exception:
-        # if LLM returns text, attempt to extract JSON substring
+        # fallback: extract JSON substring if wrapped in text
         import re
         m = re.search(r'(\{.*\})', out, re.S)
         if m:
@@ -84,9 +164,15 @@ def evaluate_answer(question, answer, mode, role):
                 return json.loads(m.group(1))
             except:
                 pass
-        # fallback minimal
-        return {"scores":{"clarity":1,"accuracy_or_examples":1,"completeness":1,"structure":1},
-                "total":4,"feedback":["Could not parse automatic evaluation reliably."],"suggested_resources":[]}
+        # safe fallback
+        return {
+            "scores": {"clarity": 0, "accuracy_or_examples": 0, "completeness": 0, "structure": 0},
+            "total": 0,
+            "verdict": "Could not evaluate",
+            "feedback": ["LLM response was not in JSON format."],
+            "suggested_resources": []
+        }
+
 
 def download_link(text: str, filename: str):
     b = base64.b64encode(text.encode()).decode()
@@ -95,7 +181,7 @@ def download_link(text: str, filename: str):
 
 # ---- UI ----
 st.set_page_config(page_title="Interview Simulator", layout="wide")
-st.title("LLM Interview Simulator — MVP")
+st.title("Interview Simulator")
 
 with st.sidebar:
     st.header("Session settings")
@@ -149,68 +235,32 @@ with cols[0]:
 with cols[1]:
     st.subheader("Feedback & Scores")
     if st.session_state['evaluations']:
-        last = st.session_state['evaluations'][-1]
-        st.json(last)
+        st.json(st.session_state['evaluations'][-1])
     else:
         st.write("No feedback yet. Submit an answer to evaluate.")
 
 st.write("---")
 if st.button("Finish & Generate Summary"):
-    # produce summary
-    total_scores = []
-    feedbacks = []
+    total_scores, feedbacks = [], []
     for ev in st.session_state['evaluations']:
         if ev.get('total') is not None:
-            total_scores.append(ev.get('total'))
+            total_scores.append(ev['total'])
         if ev.get('feedback'):
-            feedbacks.extend(ev.get('feedback'))
-    average = sum(total_scores)/len(total_scores) if total_scores else 0
+            feedbacks.extend(ev['feedback'])
+    avg = sum(total_scores)/len(total_scores) if total_scores else 0
     summary = {
         "role": role,
         "domain": domain,
         "mode": mode,
-        "n_questions": len(st.session_state['questions']),
-        "average_score": average,
+        "average_score": avg,
         "feedbacks": feedbacks,
         "evaluations": st.session_state['evaluations'],
         "answers": st.session_state['answers'],
         "questions": st.session_state['questions']
     }
     st.header("Session Summary")
-    st.write("Average score:", average)
-    st.write("Top feedback items:")
+    st.write("Average score:", avg)
     for f in feedbacks[:6]:
         st.write("- ", f)
     txt = json.dumps(summary, indent=2)
     st.markdown(download_link(txt, "session_summary.json"), unsafe_allow_html=True)
-
-    # simple PDF export using reportlab (optional)
-    try:
-        from reportlab.lib.pagesizes import letter
-        from reportlab.pdfgen import canvas
-        fn = "/tmp/session_summary.pdf"
-        c = canvas.Canvas(fn, pagesize=letter)
-        text = c.beginText(40, 750)
-        text.setFont("Helvetica", 10)
-        lines = [
-            f"Role: {role}",
-            f"Domain: {domain}",
-            f"Mode: {mode}",
-            f"Average score: {average}",
-            "",
-            "Feedback summary:"
-        ]
-        lines += feedbacks[:40]
-        for L in lines:
-            text.textLine(L)
-        c.drawText(text)
-        c.save()
-        with open(fn, "rb") as f:
-            data = f.read()
-        b64 = base64.b64encode(data).decode()
-        href = f'<a href="data:application/pdf;base64,{b64}" download="session_summary.pdf">Download PDF summary</a>'
-        st.markdown(href, unsafe_allow_html=True)
-    except Exception as e:
-        st.info("PDF export not available (reportlab not installed).")
-
-st.write("Tip: For more reliable automated scoring, tune prompts & use a specialized rubric per question type.")
