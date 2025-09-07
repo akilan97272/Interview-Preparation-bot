@@ -32,9 +32,4 @@ Perfect for **Software Engineers, Backend Devs, and Freshers** preparing for int
 
 ---
 
-## ⚡ Installation & Setup  
 
-### 1️⃣ Clone the repo  
-```bash
-git clone https://github.com/your-username/interview-simulator.git
-cd interview-simulator
